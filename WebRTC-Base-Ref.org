@@ -1,0 +1,121 @@
+#+TITLE: WebRTC源码阅读－基础引用类
+#+OPTIONS: showall
+
+* 内容
+本文涉及内容包括以下的实现
+1. rtc::scoped_refptr
+2. rtc::RefCountedObject
+3. rtc::RefCountInterface
+4. webrtc::webrtc_impl::RefCounter
+   
+* 涉及的文件
+- api/scoped_refptr.h
+- rtc_base/ref_counted_object.h
+- rtc_base/ref_count.h
+- rtc_base/ref_counter.h
+- rtc_base/atomic_ops.h
+
+* 引用计数
+scoped_refptr这个智能指针在webrtc的源码中使用广泛，但它的原理比较简单，同C++11的shared_ptr一样是基于引用计数的智能指针。
+
+一个简单的智能指针一般包括下图的三个部分：
+#+BEGIN_SRC dot :file image/baseref/base-ref.png
+  digraph baseref {
+          rankdir=LR;
+          node[shape=box];
+          ptr -> real_ptr -> object;
+  }
+#+END_SRC
+
+#+RESULTS:
+[[file:image/baseref/base-ref.png]]
+
+当智能指针ptr创建时，会同时创建一个real_ptr和object。而real_ptr中维护着object真正的指针和该对象的引用计数。ptr可以通过real_ptr来访问到真正的object。
+
+如果这个时候发生了复制行为，例如参数传递（非传递引用），并不会复制object本身，而是给real_ptr中维护的引用计数增加一。删除ptr也是同理，但是当引用计数减少到0时，会回收object。
+
+引用计数在多线程时，会产生数据竞争，所以对real_ptr的操作必须是原子行为的。
+
+* webrtc实现
+
+webrtc中使用的智能指针基本也是这个结构，只是做了些优化，scoped_refptr对应着ptr，RefCountedObject对应着real_ptr与object。
+
+可以从下面代码中看到RefCountedObject继承了真正的object类T，使用类T本身来做上节中的real_ptr结构。这样做可以少申请一次real_ptr所对应的内存。
+
+#+BEGIN_SRC c++
+template <class T>
+class RefCountedObject : public T {
+public:
+  // 对外接口
+  virtual void AddRef() const { ref_count_.IncRef(); }
+  virtual RefCountReleaseStatus Release() const {}
+  virtual bool HasOneRef() const { return ref_count_.HasOneRef(); }
+};
+#+END_SRC
+
+RefCountedObject实现用了RefCounter类来做为引用计数的具体实现，由于各个平台原子化操作可能不同，所以这里会与平台有关。webrtc的实现中使用了atomic_ops.h文件中的原子操作集合来屏蔽平台差异性，这里不再对这些原子化操作进行解释。
+
+而scoped_refptr的代码如下，代码有裁剪：
+#+BEGIN_SRC c++
+template <class T>
+class scoped_refptr {
+ public:
+  typedef T element_type;
+
+  scoped_refptr() : ptr_(nullptr) {}
+
+  scoped_refptr(T* p) : ptr_(p) {  // NOLINT(runtime/explicit)
+    if (ptr_)
+      ptr_->AddRef();
+  }
+  // ...
+  // Move constructors.
+  scoped_refptr(scoped_refptr<T>&& r) : ptr_(r.release()) {}
+
+  ~scoped_refptr() {
+    if (ptr_)
+      ptr_->Release();
+  }
+
+  T* get() const { return ptr_; }
+  operator T*() const { return ptr_; }
+  T* operator->() const { return ptr_; }
+
+  T* release() {
+    T* retVal = ptr_;
+    ptr_ = nullptr;
+    return retVal;
+  }
+
+  // 重载=...
+  scoped_refptr<T>& operator=(T* p) {
+    // AddRef first so that self assignment should work
+    if (p)
+      p->AddRef();
+    if (ptr_)
+      ptr_->Release();
+    ptr_ = p;
+    return *this;
+  }
+  // ...
+
+  void swap(scoped_refptr<T>& r) { swap(&r.ptr_); }
+
+ protected:
+  T* ptr_;
+};
+#+END_SRC
+可以看到其中重载了如=,(),->等操作符，用来模拟原始指针。而其中的指针类型为T，在重载各个函数时，调用了诸如T::AddRef()、 T::Release()函数。而这些函数正是RefCountedObject类中的函数，当然不仅限于 RefCountedObject类，其他实现AddRef等接口的类也可以被scoped_refptr来使用。
+
+这里就需要提一下rtc::RefCountInterface类了，这个类就是另外一个实现AddRef接口的类了。那么RefCountInterface类与RefCountedObject类有什么区别呢？在我的理解中，webrtc源码中所有涉及到对外的类都会有Interface做为后缀。举个例子，ice协议实现的接口是IceTransportInterface类，但是该类没有AddRef等接口。为了让诸如此等对外的类都能够使用scoped_refptr，这里构建了一个RefCountInterface基类，来添加AddRef等scoped_refptr所必须的方法。
+
+另一个值得注意的就是scoped_refptr在析构中对ptr_做计数减一，这样可以随着该scoped_ptr生命周期来释放对应的object，而不必显式释放。
+
+* 使用
+下面是源码中的一个使用示例:
+#+BEGIN_SRC c++
+  rtc::scoped_refptr<AudioDecoderFactory> decoder_factory =
+      new rtc::RefCountedObject<ReplacementAudioDecoderFactory>(
+          replacement_file_name, file_sample_rate_hz);
+#+END_SRC
+其中ReplacementAudioDecoderFactory是AudioDecoderFactory的子类，RefCountedObject类构造函数是ReplacementAudioDecoderFactory构造函数的透传。
