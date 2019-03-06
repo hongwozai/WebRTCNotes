@@ -1,0 +1,109 @@
+#+TITLE: WebRTC源码阅读－基础异步DNS解析
+
+* 前置
+
+- Thread
+
+* 内容
+
+一个ip地址表示类与一个异步域名解析的类, AsyncResolverInterface是该模块对外的接口。
+
+- AsyncResolverInterface
+- AsyncResolverFactory
+- SocketAddress
+- IPAddress
+- SignalThread
+
+* 涉及文件
+
+- rtc_base/socket_address.h
+- rtc_base/async_resolver_interface.h
+- rtc_base/async_resolver_interface.cc
+- rtc_base/net_helpers.h
+- rtc_base/net_helpers.cc
+- rtc_base/signal_thread.h
+
+* webrtc中地址的表示
+webrtc中使用IPAddress类来表示地址，其结构如下
+#+BEGIN_SRC c++
+class IPAddress {
+public:
+  // 省略n多方法
+  std::string ToString() const;
+  // 会将v4转换的v6地址转换为ipv4地址
+  IPAddress Normalized() const;
+  // ipv4地址转换为类似于::ffff:a.b.c.d的地址
+  IPAddress AsIPv6Address() const;
+private:
+  int family_;
+  union {
+    in_addr ip4;
+    in6_addr ip6;
+  } u_;
+};
+#+END_SRC
+
+可以看到该IPAddress的主要作用就是兼容ipv4与ipv6。该类还有一些转换方法等此处不在解读。
+
+现在再来看另一个SocketAddress结构：
+#+BEGIN_SRC c++
+class SocketAddress {
+public:
+  // 省略n多方法
+private:
+  std::string hostname_;
+  IPAddress ip_;
+  uint16_t port_;
+  int scope_id_;
+  // 用来指明hostname中是否是字符串形式的ip
+  bool literal_;
+};
+#+END_SRC
+
+SocketAddress的实质是维护ip:port对，其中hostname并不是域名而是ip的字符串形式，也没有在这个类中进行dns解析。
+
+* SignalThread
+
+SignalThread继承自MessageHandler。
+
+SignalThread会创建一个Worker线程，Worker线程最终会执行SignalThread::Run函数。而Run函数会调用SignalThread::DoWork函数，DoWorker由来子类实现。当DoWorker运行完毕时，会投递一个消息到MainThread线程的消息队列中，这个消息最终会执行到SignalThread::OnMessage上（MainThread线程运行），用来通知当前事件运行完毕。
+
+当调用SignalThread的线程MainThread被销毁时，会通知并调用SignalThread::OnMainThreadDestroyed函数。
+
+当使用完Worker线程时，可以将SignalDoneWork链接到相应的函数上。在运行完事件时，会在OnMessage中发信号通知。
+
+* 异步DNS解析
+
+AsyncResolverInterface是该模块对外的接口，而AsyncResolver是接口的具体实现类，在net_helper.h/.cc文件中。
+
+#+BEGIN_SRC c++
+  class AsyncResolver : public SignalThread, public AsyncResolverInterface {
+   public:
+    AsyncResolver();
+    ~AsyncResolver() override;
+
+    void Start(const SocketAddress& addr) override;
+    bool GetResolvedAddress(int family, SocketAddress* addr) const override;
+    int GetError() const override;
+    void Destroy(bool wait) override;
+
+    const std::vector<IPAddress>& addresses() const { return addresses_; }
+    void set_error(int error) { error_ = error; }
+
+   protected:
+      /* 以下实现SignalThread的接口 */
+    void DoWork() override;
+    void OnWorkDone() override;
+
+   private:
+    SocketAddress addr_;
+    std::vector<IPAddress> addresses_;
+    int error_;
+  };
+#+END_SRC
+
+AsyncResolver继承自SignalThread类，会创建一个Worker线程来调用getaddrinfo来解析，并在解析完成后通过SignalDone信号进行通知。
+
+当返回多个地址时，GetResolvedAddress会使用第一个family匹配的地址。
+
+* 使用
